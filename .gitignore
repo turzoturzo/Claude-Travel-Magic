@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env
+.venv/
+
+# macOS
+.DS_Store
+
+# Travel Data (Mined/Sensitive)
+*.mbox
+*.eml
+*.rtf
+Training_Emails/
+extraction_cache.json
+
+# Results & Analysis
+*.csv
+*.jsonl
+*.json
+*.summary.txt
+training_emails_analysis.csv
+training_emails_analysis.json
+training_emails_table.csv
+training_emails_table.json
+travel_timeline.csv
+matt_inbox_results.*
+matt_travel_results*
+training_results*
+results*
+
+# Exclude specific app files if they are part of a different project
+src/**/
+*.sh
+requirements.txt
+tests/
+test_*.py
+parse_training_emails.py
+process_training_emails.py
+src/
+!travel_sorter.py
+!README.md
+!.gitignore
