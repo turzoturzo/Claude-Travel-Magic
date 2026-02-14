@@ -64,4 +64,10 @@ process_training_emails.py
 src/
 !travel_sorter.py
 !README.md
+!README 2.md
 !.gitignore
+!.env.example
+!build_itinerary.py
+!travel_itinerary/
+!travel_itinerary/**/*.py
+!output/
