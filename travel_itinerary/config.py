@@ -8,10 +8,17 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-# --- OpenAI ---
+# --- LLM API ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-LLM_MODEL_PRIMARY = os.getenv("LLM_MODEL_PRIMARY", "gpt-4o-mini")
-LLM_MODEL_FALLBACK = os.getenv("LLM_MODEL_FALLBACK", "gpt-4o")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
+# Default to Gemini via OpenAI-compatible endpoint; fall back to OpenAI if no Google key
+LLM_BACKEND = os.getenv("LLM_BACKEND", "gemini" if GOOGLE_API_KEY else "openai")
+LLM_MODEL_PRIMARY = os.getenv("LLM_MODEL_PRIMARY", "gemini-2.5-flash-preview-05-20" if LLM_BACKEND == "gemini" else "gpt-4o-mini")
+LLM_MODEL_FALLBACK = os.getenv("LLM_MODEL_FALLBACK", "gemini-2.0-flash" if LLM_BACKEND == "gemini" else "gpt-4o")
+
+# --- Traveler ---
+DEFAULT_TRAVELER_NAME = os.getenv("TRAVELER_NAME", "Matthew Turzo")
 
 # --- Paths ---
 MBOX_PATH = os.getenv("MBOX_PATH", str(PROJECT_ROOT / "2025-1-16_TRAVEL_MATTHEW TURZO.mbox"))

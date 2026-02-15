@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from travel_itinerary.config import BATCH_SIZE, MBOX_PATH
+from travel_itinerary.config import BATCH_SIZE, DEFAULT_TRAVELER_NAME, MBOX_PATH
 from travel_itinerary.models import (
     CityVisit,
     EventType,
@@ -134,16 +134,50 @@ def _normalize_extraction(raw: Dict, email_date: str = "") -> Optional[TravelEve
         provider=raw.get("provider") or "",
         property_name=raw.get("property_name") or "",
         activity_name=raw.get("activity_name") or "",
+        traveler_name=raw.get("traveler_name") or "",
         legs=legs,
         extraction_confidence=raw.get("confidence", 0.0),
         raw_extraction=raw,
     )
 
 
+_FIRST_NAME_VARIANTS = {
+    "matthew": {"matt", "matthew", "mat"},
+}
+
+
+def _normalize_first(name: str) -> set[str]:
+    """Return a set of recognized variants for a first name."""
+    low = name.lower()
+    for canonical, variants in _FIRST_NAME_VARIANTS.items():
+        if low in variants:
+            return variants
+    return {low}
+
+
+def _is_traveler_match(event: TravelEvent, traveler_name: str) -> bool:
+    """Check if event belongs to the given traveler (first + last name match)."""
+    name = event.traveler_name.strip()
+    if not name:
+        return True  # no traveler info → assume it's ours (backward compat with cache)
+    event_parts = name.lower().split()
+    target_parts = traveler_name.lower().split()
+    if not event_parts or not target_parts:
+        return True
+    # Last name must match
+    if event_parts[-1] != target_parts[-1]:
+        return False
+    # First name must match (with variant handling for Matt/Matthew)
+    event_first_variants = _normalize_first(event_parts[0])
+    target_first_variants = _normalize_first(target_parts[0])
+    return bool(event_first_variants & target_first_variants)
+
+
 def run_pipeline(
     mbox_path: Optional[str] = None,
     skip_classify: bool = False,
     verbose: bool = True,
+    traveler_name: Optional[str] = None,
 ) -> Tuple[List[CityVisit], List[Gap], List[TravelEvent]]:
     """Run the full pipeline end to end.
 
@@ -151,10 +185,12 @@ def run_pipeline(
         mbox_path: Path to the mbox file. Defaults to config.
         skip_classify: If True, extract from ALL emails (not just travel-classified).
         verbose: Print progress to stderr.
+        traveler_name: Filter events to this traveler. Defaults to config DEFAULT_TRAVELER_NAME.
 
     Returns:
         (city_visits, gaps, deduped_events)
     """
+    traveler_name = traveler_name or DEFAULT_TRAVELER_NAME
     mbox_path = mbox_path or MBOX_PATH
     cache = ExtractionCache()
 
@@ -219,15 +255,22 @@ def run_pipeline(
 
     log(f"  Extracted {len(events)} events (API calls: {api_calls}, cache hits: {cache_hits})")
 
-    # Step 3: Deduplicate
+    # Step 3: Filter by traveler name
+    before_filter = len(events)
+    events = [e for e in events if _is_traveler_match(e, traveler_name)]
+    filtered_count = before_filter - len(events)
+    if filtered_count:
+        log(f"  Filtered out {filtered_count} events for other travelers (keeping: {traveler_name})")
+
+    # Step 4: Deduplicate
     deduped = deduplicate(events)
     log(f"  After dedup: {len(deduped)} unique events")
 
-    # Step 4: Build timeline
+    # Step 5: Build timeline
     visits = build_timeline(deduped)
     log(f"  Assembled {len(visits)} city visits")
 
-    # Step 5: Detect gaps
+    # Step 6: Detect gaps
     visits, gaps = detect_gaps(visits)
     log(f"  Detected {len(gaps)} gaps (>{__import__('travel_itinerary.config', fromlist=['GAP_THRESHOLD_DAYS']).GAP_THRESHOLD_DAYS} days)")
 

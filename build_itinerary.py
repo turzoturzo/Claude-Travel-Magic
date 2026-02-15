@@ -16,13 +16,15 @@ import argparse
 import sys
 from pathlib import Path
 
-from travel_itinerary.config import MBOX_PATH, OUTPUT_DIR
+from travel_itinerary.config import DEFAULT_TRAVELER_NAME, MBOX_PATH, OUTPUT_DIR
 from travel_itinerary.pipeline import run_pipeline
 from travel_itinerary.output import (
     format_timeline,
     visits_to_csv,
     events_to_csv,
     to_json,
+    format_global_entry_html,
+    format_travel_map_html,
 )
 
 
@@ -48,14 +50,19 @@ def main():
     )
     parser.add_argument(
         "--format",
-        choices=["timeline", "csv", "json", "all"],
+        choices=["timeline", "csv", "json", "global-entry", "map", "all"],
         default="all",
-        help="Output format",
+        help="Output format (timeline, csv, json, global-entry, map, all)",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show stats only, don't write files",
+    )
+    parser.add_argument(
+        "--traveler-name",
+        default=DEFAULT_TRAVELER_NAME,
+        help=f"Filter to trips for this traveler (default: {DEFAULT_TRAVELER_NAME})",
     )
     args = parser.parse_args()
 
@@ -66,6 +73,7 @@ def main():
         mbox_path=args.mbox,
         skip_classify=args.extract_all,
         verbose=True,
+        traveler_name=args.traveler_name,
     )
 
     if args.dry_run:
@@ -94,6 +102,16 @@ def main():
         json_path = output_dir / "itinerary.json"
         to_json(visits, gaps, json_path)
         print(f"JSON written to: {json_path}")
+
+    if args.format in ("global-entry", "all"):
+        ge_path = output_dir / "global_entry.html"
+        format_global_entry_html(visits, ge_path)
+        print(f"Global Entry report written to: {ge_path}")
+
+    if args.format in ("map", "all"):
+        map_path = output_dir / "travel_map.html"
+        format_travel_map_html(visits, map_path)
+        print(f"Travel map written to: {map_path}")
 
 
 if __name__ == "__main__":

@@ -51,6 +51,7 @@ class TravelEvent:
     provider: str = ""
     property_name: str = ""  # hotel/Airbnb name
     activity_name: str = ""  # tour/event name
+    traveler_name: str = ""  # passenger/guest name from booking
     legs: list[FlightLeg] = field(default_factory=list)
     source_email_id: str = ""
     source_subject: str = ""

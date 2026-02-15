@@ -1,4 +1,4 @@
-"""OpenAI GPT extraction of structured travel data from email content."""
+"""LLM extraction of structured travel data from email content."""
 
 import json
 import re
@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 from travel_itinerary.config import (
+    GOOGLE_API_KEY,
+    LLM_BACKEND,
     LLM_MODEL_FALLBACK,
     LLM_MODEL_PRIMARY,
     MAX_BODY_CHARS,
@@ -19,7 +21,13 @@ _client: Optional[OpenAI] = None
 def _get_client() -> OpenAI:
     global _client
     if _client is None:
-        _client = OpenAI(api_key=OPENAI_API_KEY)
+        if LLM_BACKEND == "gemini":
+            _client = OpenAI(
+                api_key=GOOGLE_API_KEY,
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            )
+        else:
+            _client = OpenAI(api_key=OPENAI_API_KEY)
     return _client
 
 
@@ -52,6 +60,7 @@ Return a JSON object (no markdown fences) with these fields:
       "carrier": "United Airlines"
     }
   ],
+  "traveler_name": "full name of the passenger/guest or null",
   "confidence": 0.0 to 1.0
 }
 
@@ -61,6 +70,7 @@ Rules:
 - For trains/buses: origin = departure station city, destination = arrival station city.
 - For car rentals: origin = pickup city, destination = return city (may be same).
 - For tours/activities: destination = activity city, activity_name = event name, start_date = event date.
+- traveler_name: the passenger, guest, or traveler's full name as shown on the booking. If multiple travelers, return the primary one. null if not identifiable.
 - confirmation_number: booking reference, PNR, itinerary number — whatever uniquely identifies the booking.
 - property_name: the actual hotel/Airbnb name (e.g. "The Lexington NYC"), not the platform.
 - Dates must be YYYY-MM-DD. If you only see a month and day, use the email's year.

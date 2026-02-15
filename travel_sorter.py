@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Travel Sorter: Local, Offline MECE Classification for Travel Emails
-Supports English, Spanish, French, German, Italian, and Portuguese.
+Travel Sorter V2: The Extraction Enabler
+- Based on v2b 2026.7
+- ADDS: JSONL export of full email bodies for matched confirmations.
+- Logic priority: Hotels match Lodging even if Trusted catch-all exists.
+- Output:
+    1. CSV with Confirmed Travel (Grouped by ID).
+    2. JSONL with full bodies for those confirmed items.
 """
 
 import sys
@@ -11,539 +16,305 @@ import csv
 import json
 import mailbox
 import argparse
-from datetime import datetime
 from email.header import decode_header
 from typing import List, Dict, Any, Tuple, Optional
 from bs4 import BeautifulSoup
+from email.utils import parsedate_to_datetime
 
-# --- CONFIGURATION & TAXONOMY ---
+# --- CONFIGURATION ---
 
 CATEGORIES = [
-    "FLIGHT_CONFIRMATION",
-    "LODGING_CONFIRMATION",
-    "RAIL_CONFIRMATION",
-    "BUS_FERRY_CONFIRMATION",
-    "CAR_RENTAL_TRANSFER",
-    "TOUR_ACTIVITY_TICKET",
-    "TRAVEL_DOCUMENT_ADMIN",
-    "TRAVEL_CHANGE_DISRUPTION",
-    "TRAVEL_MARKETING_NEWSLETTER",
-    "NON_TRAVEL"
+    "FLIGHT_CONFIRMATION", "LODGING_CONFIRMATION", "RAIL_CONFIRMATION",
+    "BUS_FERRY_CONFIRMATION", "CAR_RENTAL_TRANSFER", "TOUR_ACTIVITY_TICKET",
+    "TRAVEL_DOCUMENT_ADMIN", "TRAVEL_CHANGE_DISRUPTION",
+    "TRAVEL_MARKETING_NEWSLETTER", "NON_TRAVEL"
 ]
 
-CATEGORY_PRIORITY = {cat: i for i, cat in enumerate(CATEGORIES)}
-
-# --- MULTI-LANGUAGE PATTERNS ---
-
-# High-signal booking identifiers (PNR, Confirmation numbers)
-BOOKING_REF_PATTERNS = [
-    r'booking\s+(?:ref|reference|code|number)',
-    r'confirmation\s+(?:number|id|code|ref)',
-    r'reservation\s+(?:number|id|code|ref)',
-    r'record\s+locator',
-    r'pnr\b',
-    r'e-ticket',
-    r'itinerary\s+number',
-    # ES
-    r'número\s+de\s+reserva',
-    r'código\s+de\s+reserva',
-    r'nº\s+de\s+reserva',
-    r'localizador\b',
-    # FR
-    r'numéro\s+de\s+réservation',
-    r'code\s+de\s+réservation',
-    r'dossier\s+numéro',
-    # DE
-    r'buchungsnummer',
-    r'reservierungsnummer',
-    r'buchungscode',
-    # IT
-    r'numero\s+di\s+prenotazione',
-    r'codice\s+prenotazione',
-    # PT
-    r'número\s+da\s+reserva',
-    r'código\s+da\s+reserva'
-]
-
-# Category-specific signals
-SIGNALS = {
-    "FLIGHT_CONFIRMATION": {
-        "high": [
-            r'\b(?:boarding\s+pass|gate|terminal|seat)\b',
-            r'\b(?:vuelo|vol|voo|flug|volo)\b\s*[A-Z]{2}\s?\d{2,4}',  # Flight number patterns
-            r'\b(?:iata|e-ticket|e-ticket|itinerary\s+receipt)\b',
-            r'\b[A-Z]{3}\s*[-–→>]\s*[A-Z]{3}\b'  # IATA pairs like BCN-VIE
-        ],
-        "med": [
-            r'flight', r'airline', r'airport', r'airline', r'airways', 
-            r'vuelo', r'vol', r'volo', r'voo', r'flug'
-        ]
-    },
-    "LODGING_CONFIRMATION": {
-        "high": [
-            r'check-in\s+date', r'check-out\s+date', r'hotel\s+reservation',
-            r'\bnights\b', r'\bnoches\b', r'\bnuits\b', r'\bnächte\b', r'\bnotti\b', r'\bnoites\b',
-            r'reservation\s+confirmed'
-        ],
-        "med": [
-            r'hotel', r'resort', r'apartment', r'airbnb', r'hostel', r'lodging', r'stay',
-            r'colazione', r'breakfast'
-        ]
-    },
-    "RAIL_CONFIRMATION": {
-        "high": [
-            r'\bcarriage\b', r'\bcoach\b', r'\bplatform\b', r'\btrack\s+\d+\b', r'seat\s+reservation',
-            r'amtrak', r'eurostar', r'trenitalia', r'sncf', r'renfe', r'db\s+bahn', r'öbb', r'sbb', r'thalys'
-        ],
-        "med": [
-            r'train', r'rail', r'station', r'tren', r'gare', r'hauptbahnhof', r'sants', r'stazione', r'estação'
-        ]
-    },
-    "BUS_FERRY_CONFIRMATION": {
-        "high": [
-            r'bus\s+station', r'ferry', r'boat', r'boarding\s+gate', r'coach\s+station',
-            r'flixbus', r'greyhound', r'balearia', r'fred\s+olsen', r'moby'
-        ],
-        "med": [
-            r'autobus', r'ferry', r'barco', r'schiff', r'traghetto'
-        ]
-    },
-    "CAR_RENTAL_TRANSFER": {
-        "high": [
-            r'pick-up', r'drop-off', r'rental\s+agreement', r'rental\s+car', r'hertz', r'avis', r'sixt', r'europcar', r'enterprise', r'budget'
-        ],
-        "med": [
-            r'car\s+rental', r'alquiler\s+de\s+coches', r'location\s+de\s+voitures', r'autovermietung', r'noleggio\s+auto', r'aluguel\s+de\s+carros'
-        ]
-    },
-    "TOUR_ACTIVITY_TICKET": {
-        "high": [
-            r'tour\s+booking', r'ticket\s+confirmation', r'admittance', r'voucher\s+code', r'meeting\s+point', r'time\s+slot',
-            r'viator', r'getyourguide', r'klook', r'tiqets'
-        ],
-        "med": [
-            r'activity', r'tour', r'excursion', r'attraction', r'experience', r'museum', r'concerto', r'visita'
-        ]
-    },
-    "TRAVEL_DOCUMENT_ADMIN": {
-        "high": [
-            r'visa\b', r'\bETA\b', r'electronic\s+travel\s+authorization', r'insurance\s+policy', r'parking\s+reservation', 
-            r'airport\s+parking', r'lounge\s+access',
-            r'health\s+declaration', r'passenger\s+locator\s+form'
-        ],
-        "med": [
-            r'travel\s+document', r'travel\s+policy', r'insurance', r'parking'
-        ]
-    },
-    "TRAVEL_CHANGE_DISRUPTION": {
-        "high": [
-            r'schedule\s+change', r'cancellation\s+notice', r'cancelled', r'rebooked', r'flight\s+delay',
-            r'refund\s+confirmation', r'modified\s+booking'
-        ],
-        "med": [
-            r'changed', r'cancelado', r'annulé', r'storniert', r'cancellato', r'delay', r'update'
-        ]
-    },
-    "TRAVEL_MARKETING_NEWSLETTER": {
-        "high": [
-            r'special\s+offer', r'vacation\s+deals', r'low\s+fares', r'book\s+now\s+and\s+save', r'where\s+to\s+go\s+next',
-            r'exclusive\s+deals', r'bonus\s+points', r'miles\s+offer'
-        ],
-        "med": [
-            r'newsletter', r'marketing', r'promotion', r'sale', r'inspiration', r'travel\s+guide'
-        ]
-    }
+TRUSTED_TRAVEL_DOMAINS = {
+    "united.com", "delta.com", "aa.com", "southwest.com", "jetblue.com", "alaskaair.com",
+    "aircanada.ca", "britishairways.com", "lufthansa.com", "airfrance.com", "klm.com",
+    "ryanair.com", "easyjet.com", "emirates.com", "qatarairways.com", "turkishairlines.com",
+    "vueling.com", "wizzair.com", "norwegian.com", "iberia.com", "tap.pt", "flytap.com",
+    "booking.com", "expedia.com", "hotels.com", "airbnb.com", "agoda.com", "trip.com",
+    "priceline.com", "kayak.com", "hoteltonight.com", "marriott.com", "hilton.com", "hyatt.com",
+    "ihg.com", "accor.com", "h10hotels.com", "trainline.com", "eurostar.com", "renfe.com",
+    "amtrak.com", "hertz.com", "avis.com", "enterprise.com", "sixt.com", "uber.com", "lyft.com",
+    "sprucetoninn.com"
 }
 
-# Negative signals - common false positives (e-commerce, generic receipts, marketing)
-NEGATIVE_SIGNALS = [
-    r'shipped\b', r'tracking\s+number', r'order\s+shipped',
-    r'enviado\b', r'expédié\b', r'versandt\b',
-    r'password\s+reset', r'verify\s+email', r'subscription\s+confirmed',
-    r'receipt\s+for\s+your\s+payment\s+to\s+spotify',
-    r'amazon\s+order', r'apple\s+receipt',
-    r'paperless\s+enrollment', r'credit\s+journey', r'point\s+transfer',
-    r'special\s+offer', r'exclusive\s+deal', r'win\s+a\s+trip', r'giveaway',
-    r'limited\s+time\s+offer', r'save\s+up\s+to', r'book\s+now\b',
-    r'newsletter', r'promotional', r'opt-out', r'unsubscribe'
+BLOCK_DOMAINS = {
+    "linkedin.com", "substack.com", "beehiiv.com", "ccsend.com", "democrats.org",
+    "amazon.com", "amazon.es", "amazon.co.uk", "soundcloud.com", "angellist.com",
+    "proton.me", "hometalk.com", "ostrichpillow.com", "kickstarter.com", "shopifyemail.com",
+    "wonderbly.com", "abchome.com", "bengsforsouthdakota.com", "debhaaland.com",
+    "kathyhochul.com", "womensmarch.com", "statedemocrats.com", "colemanrg.com",
+    "slack.com", "omnihotels.com", "temu.com", "flightschedulepro.com", "eaglecreek.com",
+    "waterdropfilter.eu", "guitarcenter.com", "robinhood.com", "americanexpress.com",
+    "teamtailor-mail.com", "wcs.org", "eat24.com"
+}
+
+BLOCK_SUBJECTS_RE = [
+    r'Rewards', r'Deals', r'Win\s+tickets', r'Reward\s+nights', r'Blackout\s+dates',
+    r'Choose\s+the\s+place', r'Flip\s+flops', r'Turn\s+your\s+travel\s+plans', r'Travel\s+recap',
+    r'Milestones', r'Future\s+Flight\s+Credit', r'Honors\s+is\s+coming', r'Statement\s+period',
+    r'Processing\s+your\s+order', r'Shipment\s+is\s+on\s+its\s+way', r'Order\s+receipt',
+    r'NEW\s+routes', r'Seats\s+on\s+Sale', r'fares\s+before\s+they\'re\s+gone', r'adventure\s+starts',
+    r'Christmas', r'wishes\s+come\s+true', r'Black\s+Days', r'Cyber\s+Monday', r'Last\s+call',
+    r'stop\s+reminding\s+you', r'Forgot\s+to\s+book', r'Monthly\s+statement', r'weekly\s+account\s+snapshot',
+    r'Individual\s+account\s+statement', r'Unlocked\s+Free\s+Express\s+Delivery', r'Holiday\s+Gift\s+Guide'
 ]
 
-# Admin and Support signals (High signal for NOT being a travel confirmation)
-ADMIN_AUTH_SIGNALS = [
-    r'secure\s+sign\s+in\s+code', r'your\s+otp', r'verification\s+code',
-    r'support\s+ticket', r'customer\s+support', r'help\s+desk', r'zendesk',
-    r'password\s+change', r'account\s+access', r'update\s+my\s+email',
-    r'credit\s+limit\s+increase', r'application\s+received', r'insufficient\s+funds'
+PNR_BLOCKLIST = {
+    "FRIDAY", "MONDAY", "BUDGET", "SECURE", "STARTS", "MOMENT", "PLACES", "CHANGE",
+    "POSSIBLE", "LISTEN", "PICKED", "LOOKED", "UPDATE", "SYSTEM", "TRAVEL", "SAMPLE",
+    "SUNDAY", "TUESDAY", "FINISH", "BOOKING", "FUTURE", "MESSAGE", "ABOUT", "THROUGH",
+    "COUNTRY", "LAWSUIT", "REQUIRE", "LIMITED", "OCTOBER", "BEYOND", "MATTHEW", "BAGGAGE",
+    "CONNECT", "PASSED", "CLIENT", "NOTICE", "REPORT", "CONFIRMED", "DETAILED", "DETAILS",
+    "RESERVATIONS", "FLIGHTS", "BOOKINGS", "TICKETS", "BARCELONA", "PASSENGER", "UPGRADE",
+    "AVAILABLE", "ADVENTURE", "HOLIDAY", "WAITING", "SQUEEZE", "ORLANDO", "LIBERIA",
+    "ANNUAL", "GOWILD", "HOTELS", "PLAINS", "WINTER", "FLIGHT", "TRIP", "ENJOY", "CREDIT",
+    "DOCTYPE", "HTML", "PUBLIC"
+}
+
+BOOKING_KEYWORDS = [
+    r'\bbooking\s*(?:ref|reference|code|number|id|#)\b',
+    r'\bconfirmation\s*(?:number|id|code|ref|conf|#)\b',
+    r'\breservation\s*(?:number|id|code|ref|conf|#)\b',
+    r'\bpnr\b', r'\be-ticket\b', r'\bitinerary\b', r'\breserva\b', r'\blocalizador\b',
+    r'\bRes\s*Id\b'
 ]
 
-# --- HELPER CLASSES ---
+STRUCTURAL = {
+    "FLIGHT": { "IATA_PAIR": r'\b[A-Z]{3}\s*[-–→>]\s*[A-Z]{3}\b' },
+    "LODGING": { "DATE_PAIR": r'\bcheck-in\b.{1,200}\bcheck-out\b' }
+}
+
+AIRLINES = ["United", "American", "Delta", "Southwest", "Air Canada", "Alaska", "Spirit", "JetBlue", "Ryanair", "Lufthansa", "British Airways", "Iberia", "Air France", "KLM", "EasyJet", "Turkish Airlines", "Wizz Air", "Emirates", "Qatar Airways", "Vueling", "Norwegian", "TAP Air"]
+HOTELS = ["Marriott", "Ritz-Carlton", "St. Regis", "Hilton", "DoubleTree", "IHG", "Holiday Inn", "Hyatt", "Wyndham", "Accor", "Aloft", "Kimpton", "Omni", "Arlo", "H10", "Spruceton Inn"]
+PLATFORMS = ["Booking.com", "Expedia", "Hotels.com", "Airbnb", "Agoda", "Trip.com", "Priceline", "Kayak", "HotelTonight", "Trainline", "Eurostar"]
+
+def make_reg(patterns): return [re.compile(p, re.I) for p in patterns]
+def make_brand_reg(brands):
+    joined = "|".join([re.escape(b) for b in sorted(brands, key=len, reverse=True)])
+    return re.compile(fr"\b(?:{joined})\b", re.I)
 
 class EmailParser:
     @staticmethod
-    def decode_str(s: str) -> str:
-        if not s:
-            return ""
-        decoded = decode_header(s)
-        parts = []
-        for part, encoding in decoded:
-            if isinstance(part, bytes):
-                try:
-                    parts.append(part.decode(encoding or "utf-8", errors="ignore"))
-                except:
-                    parts.append(part.decode("utf-8", errors="ignore"))
-            else:
-                parts.append(str(part))
-        return "".join(parts)
-
-    @staticmethod
-    def get_text_from_html(html: str) -> str:
-        if not html:
-            return ""
-        soup = BeautifulSoup(html, "html.parser")
-        # Remove script and style elements
-        for script in soup(["script", "style"]):
-            script.decompose()
-        return soup.get_text(separator=" ", strip=True)
+    def decode_str(s: Any) -> str:
+        if s is None: return ""
+        s_str = str(s)
+        try:
+            decoded = decode_header(s_str); parts = []
+            for part, encoding in decoded:
+                if isinstance(part, bytes):
+                    try: parts.append(part.decode(encoding or "utf-8", errors="ignore"))
+                    except: parts.append(part.decode("iso-8859-1", errors="ignore"))
+                else: parts.append(str(part))
+            return " ".join("".join(parts).split())
+        except: return s_str
 
     @staticmethod
     def extract_content(msg: mailbox.Message) -> Dict[str, Any]:
         subject = EmailParser.decode_str(msg.get("subject", ""))
         from_header = EmailParser.decode_str(msg.get("from", ""))
-        to_header = EmailParser.decode_str(msg.get("to", ""))
-        date_header = msg.get("date", "")
-        message_id = msg.get("Message-ID", "")
+        date_header = EmailParser.decode_str(msg.get("date", ""))
 
-        body_text = ""
-        html_content = ""
-        attachments = []
+        final_date = date_header
+        try:
+            dt = parsedate_to_datetime(date_header)
+            if dt:
+                 final_date = dt.isoformat()
+        except:
+             pass
 
+        body_text = ""; html_content = ""
         if msg.is_multipart():
-            for part in msg.walk():
-                content_type = part.get_content_type()
-                disposition = str(part.get("Content-Disposition", ""))
-                filename = part.get_filename()
-
-                if filename:
-                    attachments.append({"name": filename, "type": content_type})
-
-                if "attachment" in disposition:
-                    continue
-
-                if content_type == "text/plain":
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        body_text += payload.decode(errors="ignore")
-                elif content_type == "text/html":
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        html_content += payload.decode(errors="ignore")
+            for part, submsg in enumerate(msg.walk()):
+                # multipart/alternative usually has text/plain and text/html
+                if submsg.get_content_type() == "text/plain":
+                    p = submsg.get_payload(decode=True)
+                    if p: body_text += p.decode(errors="ignore")
+                elif submsg.get_content_type() == "text/html":
+                    p = submsg.get_payload(decode=True)
+                    if p: html_content += p.decode(errors="ignore")
         else:
-            payload = msg.get_payload(decode=True)
-            if payload:
-                if msg.get_content_type() == "text/html":
-                    html_content = payload.decode(errors="ignore")
-                else:
-                    body_text = payload.decode(errors="ignore")
+            p = msg.get_payload(decode=True)
+            if p:
+                if msg.get_content_type() == "text/html": html_content = p.decode(errors="ignore")
+                else: body_text = p.decode(errors="ignore")
 
-        # If we only have HTML, convert to text
-        if html_content and not body_text:
-            body_text = EmailParser.get_text_from_html(html_content)
+        # Fallback: If body_text is suspiciously short and we have HTML, extract text from HTML
+        if html_content and len(body_text.strip()) < 20:
+            try:
+                soup = BeautifulSoup(html_content, "html.parser")
+                # Remove script and style elements
+                for script_or_style in soup(["script", "style"]):
+                    script_or_style.decompose()
 
-        return {
-            "message_id": message_id,
-            "subject": subject,
-            "from": from_header,
-            "to": to_header,
-            "date": date_header,
-            "body": body_text,
-            "attachments": attachments
-        }
+                # Get text with better spacing
+                html_text = soup.get_text(separator=" ", strip=True)
+                if len(html_text) > len(body_text):
+                    body_text = html_text
+            except: pass
+
+        return {"subject": subject, "from": from_header, "date": final_date, "body": body_text, "html": html_content}
 
 class TravelClassifier:
     def __init__(self):
-        self.booking_ref_regex = [re.compile(p, re.I) for p in BOOKING_REF_PATTERNS]
-        self.negative_regex = [re.compile(p, re.I) for p in NEGATIVE_SIGNALS]
-        self.admin_auth_regex = [re.compile(p, re.I) for p in ADMIN_AUTH_SIGNALS]
-        
-        self.category_regex = {}
-        for cat, patterns in SIGNALS.items():
-            self.category_regex[cat] = {
-                "high": [re.compile(p, re.I) for p in patterns["high"]],
-                "med": [re.compile(p, re.I) for p in patterns["med"]]
-            }
+        self.struct_flight = {k: re.compile(v, re.I) for k, v in STRUCTURAL["FLIGHT"].items()}
+        self.struct_lodging = {k: re.compile(v, re.I) for k, v in STRUCTURAL["LODGING"].items()}
+        self.block_subjects = make_reg(BLOCK_SUBJECTS_RE)
+        self.brands = {k: make_brand_reg(v) for k, v in {"AIRLINE": AIRLINES, "HOTEL": HOTELS, "PLATFORM": PLATFORMS}.items()}
+        self.kw_regs = make_reg(BOOKING_KEYWORDS)
 
-    def classify(self, email_data: Dict[str, Any]) -> Dict[str, Any]:
-        full_text = f"{email_data['subject']} {email_data['body']}"
-        cat_scores = {}
-        matched_features = []
-        
-        matches = []
-        
-        # 1. PNR / Booking Ref (High signal)
-        for reg in self.booking_ref_regex:
-            match = reg.search(full_text)
-            if match:
-                matched_features.append("BOOKING_REF")
-                matches.append(match.group(0))
-                break
+    def validate_conf(self, conf: str) -> bool:
+        if not conf: return False
+        if conf.islower() and not conf.isdigit(): return False
+        if conf.isalpha() and not conf.isupper(): return False
+        if conf.upper() in PNR_BLOCKLIST: return False
+        if len(conf) < 5 or len(conf) > 15: return False
+        if conf.isdigit() and (conf.startswith('0') or conf.startswith('44') or conf.startswith('34')): return False
+        return True
 
-        # 2. IATA Pairs (BCN-VIE, etc.)
-        iata_pair_reg = re.compile(r'\b([A-Z]{3})\s*[-–→>]\s*([A-Z]{3})\b')
-        iata_pairs = iata_pair_reg.findall(full_text)
-        if iata_pairs:
-            matched_features.append("IATA_PAIR")
-            for pair in iata_pairs:
-                matches.append(f"{pair[0]}-{pair[1]}")
+    def extract_conf_number(self, text: str) -> Optional[str]:
+        for kw_pat in self.kw_regs:
+            for m_kw in kw_pat.finditer(text):
+                window = text[m_kw.end():m_kw.end()+30]
+                possible = re.findall(r'\b([A-Z0-9]{5,15})\b', window)
+                for p in possible:
+                    if self.validate_conf(p): return p
+        return None
 
-        # 3. Flight Numbers ([A-Z]{2}\s?\d{2,4})
-        flight_num_reg = re.compile(r'\b([A-Z]{2})\s?(\d{2,4})\b')
-        flight_nums = flight_num_reg.findall(full_text)
-        if flight_nums:
-            matched_features.append("FLIGHT_NUM")
-            for fn in flight_nums:
-                matches.append(f"{fn[0]}{fn[1]}")
+    def classify(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        text = f"{data['subject']} {data['body']}"
+        subj_norm = " ".join(data['subject'].lower().split())
+        sender = data['from'].lower()
+        domain = ""
+        m = re.search(r'@([\w.-]+)', sender)
+        if m: domain = m.group(1).lower()
 
-        # 4. Dates & Check-in/out patterns
-        date_patterns = [
-            r'check-in', r'check-out', r'checkin', r'checkout',
-            r'fecha\s+de\s+entrada', r'fecha\s+de\s+salida',
-            r'date\s+d\'arrivée', r'date\s+de\s+départ',
-            r'anreise', r'abreise'
-        ]
-        for dp in date_patterns:
-            if re.search(dp, full_text, re.I):
-                matched_features.append("CHECKIN_OUT")
-                break
+        if any(d in domain for d in BLOCK_DOMAINS) or any(r.search(subj_norm) for r in self.block_subjects):
+            return {"category": "NON_TRAVEL", "is_travel": False, "confidence": 0.1, "confirmation": ""}
 
-        # Check Admin/Auth signals (High penalty)
-        has_admin = False
-        for reg in self.admin_auth_regex:
-            if reg.search(full_text):
-                has_admin = True
-                matched_features.append(f"ADMIN_{reg.pattern}")
-                break
+        conf_no = self.extract_conf_number(text[:10000])
+        if not conf_no: return {"category": "NON_TRAVEL", "is_travel": False, "confidence": 0.1, "confirmation": ""}
 
-        # Check negative/marketing signals
-        has_negative = False
-        for reg in self.negative_regex:
-            if reg.search(full_text):
-                has_negative = True
-                matched_features.append(f"NEG_{reg.pattern}")
-                break
+        is_trusted = any(d in domain for d in TRUSTED_TRAVEL_DOMAINS)
+        has_iata = self.struct_flight["IATA_PAIR"].search(text[:5000])
+        has_dates = self.struct_lodging["DATE_PAIR"].search(text.lower())
 
-        # Marketing Subject detection (Look for ?, !, or "Win", "Limited")
-        subject = email_data['subject']
-        if re.search(r'[?!]{2,}', subject) or re.search(r'\b(win|bonus|limited|last\s+chance|sale)\b', subject, re.I):
-            matched_features.append("MKTG_SUBJECT")
+        is_airline = self.brands["AIRLINE"].search(sender + " " + subj_norm)
+        is_hotel = self.brands["HOTEL"].search(sender + " " + subj_norm)
+        is_platform = self.brands["PLATFORM"].search(sender + " " + subj_norm)
 
-        # Scoring each category
-        for cat in SIGNALS.keys():
-            score = 0.0
-            cat_matches = []
-            
-            # Subject matching booster (0.2 extra for high signal in subject)
-            subject_lower = email_data['subject'].lower()
-            subject_hit = False
+        # Decision Logic Priority
+        if has_dates or is_hotel or is_platform:
+            return {"category": "LODGING_CONFIRMATION", "is_travel": True, "confidence": 1.0, "confirmation": conf_no}
+        if has_iata or is_airline:
+            return {"category": "FLIGHT_CONFIRMATION", "is_travel": True, "confidence": 1.0, "confirmation": conf_no}
+        if is_trusted:
+            return {"category": "FLIGHT_CONFIRMATION", "is_travel": True, "confidence": 0.9, "confirmation": conf_no}
 
-            # High signals (0.4 each)
-            for reg in self.category_regex[cat]["high"]:
-                if reg.search(full_text):
-                    score += 0.4
-                    cat_matches.append(reg.pattern)
-                    if reg.search(subject_lower):
-                        score += 0.2
-                        subject_hit = True
-
-            # Medium signals (0.15 each)
-            for reg in self.category_regex[cat]["med"]:
-                if reg.search(full_text):
-                    score += 0.15
-                    cat_matches.append(reg.pattern)
-                    if not subject_hit and reg.search(subject_lower):
-                        score += 0.1
-
-            # Contextual boosters
-            if score > 0 and "BOOKING_REF" in matched_features:
-                score += 0.25
-            
-            if cat == "FLIGHT_CONFIRMATION" and ("IATA_PAIR" in matched_features or "FLIGHT_NUM" in matched_features):
-                score += 0.35
-            
-            if cat == "LODGING_CONFIRMATION" and "CHECKIN_OUT" in matched_features:
-                score += 0.35
-
-            cat_scores[cat] = min(1.0, score)
-            if score > 0:
-                matched_features.extend([f"{cat}:{m}" for m in cat_matches])
-
-        # Apply penalties
-        if has_admin:
-            for cat in cat_scores:
-                if cat not in ["NON_TRAVEL"]:
-                    cat_scores[cat] -= 0.8 # Severe penalty for account admin
-        elif has_negative:
-            for cat in cat_scores:
-                if cat not in ["TRAVEL_MARKETING_NEWSLETTER", "NON_TRAVEL"]:
-                    cat_scores[cat] -= 0.5
-        
-        if "MKTG_SUBJECT" in matched_features:
-            for cat in cat_scores:
-                if cat not in ["TRAVEL_MARKETING_NEWSLETTER", "NON_TRAVEL"]:
-                    cat_scores[cat] -= 0.3
-
-        # Deciding the winner (MECE)
-        best_cat = "NON_TRAVEL"
-        max_score = 0.0
-
-        # Journey Data Check: For a travel confirmation, we ideally want high-signal journey data
-        has_journey_data = any(feat in matched_features for feat in ["BOOKING_REF", "IATA_PAIR", "FLIGHT_NUM", "CHECKIN_OUT"])
-
-        # Filter categories that pass threshold
-        candidates = [(cat, score) for cat, score in cat_scores.items() if score >= 0.4]
-        
-        if candidates:
-            # Sort by score descending, then by priority ascending
-            candidates.sort(key=lambda x: (-x[1], CATEGORY_PRIORITY[x[0]]))
-            best_cat = candidates[0][0]
-            max_score = candidates[0][1]
-
-        # Final sanity check: If it's a travel category but has NO journey data and NO high patterns, demote
-        if best_cat not in ["NON_TRAVEL", "TRAVEL_MARKETING_NEWSLETTER"]:
-            if not has_journey_data:
-                # If it's just based on a few med keywords, it's likely noise
-                if max_score < 0.6:
-                    best_cat = "NON_TRAVEL"
-                    max_score = 0.2
-
-        # Final score set for NON_TRAVEL
-        if best_cat == "NON_TRAVEL" and max_score < 0.4:
-            max_score = max(0.1, max_score)
-
-        is_travel = best_cat not in ["NON_TRAVEL", "TRAVEL_MARKETING_NEWSLETTER"]
-
-        return {
-            "category": best_cat,
-            "is_travel": is_travel,
-            "confidence": round(max_score, 2),
-            "reasons": "; ".join(list(set(matched_features[:15]))),
-            "top_tokens": ", ".join(list(set(matches[:10]))),
-            "all_scores": cat_scores
-        }
-
-# --- MAIN RUNNER ---
+        return {"category": "NON_TRAVEL", "is_travel": False, "confidence": 0.1, "confirmation": ""}
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-language Travel Email Sorter")
-    parser.add_argument("--mbox", required=True, help="Path to input .mbox file or directory of .eml files")
-    parser.add_argument("--out", required=True, help="Output filename (CSV)")
-    parser.add_argument("--debug", type=int, default=0, help="Print debug info for N messages")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mbox", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--stop-after", type=int, default=None, help="Stop after finding N confirmed emails")
+    args = parser.parse_args(); c = TravelClassifier(); ms = []
 
-    classifier = TravelClassifier()
-    records = []
-    
-    # Process input
-    iter_messages = []
+    # 1. Loading
+    print("Loading messages...")
     if os.path.isdir(args.mbox):
-        print(f"Processing directory of .eml files: {args.mbox}...")
-        for root, _, files in os.walk(args.mbox):
-            for file in files:
-                if file.lower().endswith('.eml'):
-                    path = os.path.join(root, file)
-                    with open(path, 'rb') as f:
-                        msg = mailbox.mboxMessage(f.read())
-                        iter_messages.append(msg)
-    else:
+        for r, _, fs in os.walk(args.mbox):
+            for f in fs:
+                if f.endswith('.eml'):
+                    with open(os.path.join(r,f), 'rb') as fp: ms.append(mailbox.mboxMessage(fp.read()))
+    else: ms = mailbox.mbox(args.mbox)
+
+    processed = 0
+    confirmed_entries = [] # List of Dicts
+
+    # 2. Processing
+    print(f"Processing messages...")
+    for i, m in enumerate(ms):
+        if args.limit and i >= args.limit: break
         try:
-            iter_messages = mailbox.mbox(args.mbox)
-            print(f"Processing mailbox: {args.mbox}...")
-        except Exception as e:
-            print(f"Error opening mbox: {e}")
-            sys.exit(1)
+            d = EmailParser.extract_content(m); r = c.classify(d)
+            # Filter Strategy: Only KEEP positive confirmation with a code
+            if r["is_travel"] and r["confirmation"]:
+                 entry = {
+                     "date": d["date"],
+                     "from": d["from"],
+                     "subject": d["subject"],
+                     "category": r["category"],
+                     "confidence": r["confidence"],
+                     "confirmation": r["confirmation"],
+                     # Carry payload for next step
+                     "body": d["body"],
+                     "html": d.get("html", ""),
+                     "sender_domain": d["from"] # Simplified, re-extract in next step if needed
+                 }
+                 print(f"  -> Found travel email: {d['subject'][:50]}...")
+                 confirmed_entries.append(entry)
+                 if args.stop_after and len(confirmed_entries) >= args.stop_after:
+                     print(f"Reached limit of {args.stop_after} confirmed items. Stopping.")
+                     break
 
-    count = 0
-    cat_counts = {cat: 0 for cat in CATEGORIES}
-    conf_dist = {"high": 0, "likely": 0, "possible": 0, "unlikely": 0}
+            processed += 1
+            if processed % 5000 == 0: print(f"Scanned {processed}...")
+        except: pass
 
-    with open(args.out, 'w', newline='', encoding='utf-8') as csvfile:
-        fieldnames = [
-            "message_id", "date", "from", "subject", "category", 
-            "is_travel", "confidence", "reasons", "top_tokens", "attachment_types"
-        ]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+    print(f"Extraction complete. Found {len(confirmed_entries)} confirmed items. Grouping and sorting...")
 
-        jsonl_path = args.out.replace(".csv", ".jsonl")
-        with open(jsonl_path, 'w', encoding='utf-8') as jsonl_file:
-            for i, msg in enumerate(iter_messages):
-                try:
-                    email_data = EmailParser.extract_content(msg)
-                    result = classifier.classify(email_data)
-                    
-                    # Attachment types
-                    att_types = ",".join([a["type"] for a in email_data["attachments"]])
+    # 3. Grouping & Sorting
+    # Group by confirmation code
+    grouped = {}
+    for entry in confirmed_entries:
+        code = entry["confirmation"]
+        if code not in grouped: grouped[code] = []
+        grouped[code].append(entry)
 
-                    # Update stats
-                    cat_counts[result["category"]] += 1
-                    conf = result["confidence"]
-                    if conf >= 0.9: conf_dist["high"] += 1
-                    elif conf >= 0.7: conf_dist["likely"] += 1
-                    elif conf >= 0.4: conf_dist["possible"] += 1
-                    else: conf_dist["unlikely"] += 1
+    # Prepare list for sorting groups: (min_date, list_of_entries)
+    sorted_groups = []
+    for code, group in grouped.items():
+        # Sort within the group by date
+        # Note: ISO formatted dates sort correctly as strings
+        group.sort(key=lambda x: x["date"] or "")
 
-                    row = {
-                        "message_id": email_data["message_id"],
-                        "date": email_data["date"],
-                        "from": email_data["from"],
-                        "subject": email_data["subject"],
-                        "category": result["category"],
-                        "is_travel": result["is_travel"],
-                        "confidence": conf,
-                        "reasons": result["reasons"],
-                        "top_tokens": result["top_tokens"],
-                        "attachment_types": att_types
-                    }
-                    
-                    writer.writerow(row)
-                    jsonl_file.write(json.dumps(row) + "\n")
-                    
-                    if args.debug > 0 and i < args.debug:
-                        print(f"\n--- DEBUG MESSAGE {i} ---")
-                        print(f"Subject: {email_data['subject']}")
-                        print(f"From: {email_data['from']}")
-                        print(f"Category: {result['category']} (Conf: {conf})")
-                        print(f"Reasons: {result['reasons']}")
-                        print(f"All Scores: {json.dumps(result['all_scores'], indent=2)}")
+        # Determine group start date (first email in chain)
+        start_date = group[0]["date"] or ""
+        sorted_groups.append((start_date, group))
 
-                    count += 1
-                    if count % 100 == 0:
-                        print(f"  Processed {count} messages...")
+    # Sort groups by their start date
+    sorted_groups.sort(key=lambda x: x[0])
 
-                except Exception as e:
-                    print(f"Error processing message {i}: {e}")
+    # Flatten for CSV output
+    final_output = []
+    for _, group in sorted_groups:
+        final_output.extend(group)
 
-    # Summary Output
-    summary_path = args.out.replace(".csv", ".summary.txt")
-    with open(summary_path, 'w', encoding='utf-8') as f:
-        f.write(f"Travel Sorter Summary\n")
-        f.write(f"=====================\n")
-        f.write(f"Total processed: {count}\n\n")
-        f.write(f"Categories:\n")
-        for cat in CATEGORIES:
-            pct = (cat_counts[cat] / count * 100) if count > 0 else 0
-            f.write(f"  {cat:30}: {cat_counts[cat]:5} ({pct:5.1f}%)\n")
-        
-        f.write(f"\nConfidence Distribution:\n")
-        f.write(f"  High (0.9-1.0):      {conf_dist['high']}\n")
-        f.write(f"  Likely (0.7-0.9):    {conf_dist['likely']}\n")
-        f.write(f"  Possible (0.4-0.7):  {conf_dist['possible']}\n")
-        f.write(f"  Unlikely (0.0-0.4):  {conf_dist['unlikely']}\n")
+    # 4. Writing CSV
+    print(f"Writing {len(final_output)} sorted entries to {args.out}...")
+    with open(args.out, 'w', newline='', encoding='utf-8') as f:
+        # Exclude body/html from CSV to keep it clean, but include regular fields
+        w = csv.DictWriter(f, fieldnames=["date", "from", "subject", "category", "confidence", "confirmation"])
+        w.writeheader()
+        for row in final_output:
+            # Create a shallow copy for CSV writing to exclude body/html
+            csv_row = {k:v for k,v in row.items() if k in ["date", "from", "subject", "category", "confidence", "confirmation"]}
+            w.writerow(csv_row)
 
-    print(f"\nDone! Processed {count} messages.")
-    print(f"Results saved to:")
-    print(f"  - {args.out}")
-    print(f"  - {jsonl_path}")
-    print(f"  - {summary_path}")
+    # 5. Writing JSONL
+    jsonl_out = args.out.rsplit('.', 1)[0] + '.jsonl'
+    print(f"Writing {len(final_output)} detailed entries to {jsonl_out}...")
+    with open(jsonl_out, 'w', encoding='utf-8') as f:
+        for row in final_output:
+            json.dump(row, f)
+            f.write('\n')
 
-if __name__ == "__main__":
-    main()
+    print("Done.")
+
+if __name__ == "__main__": main()
